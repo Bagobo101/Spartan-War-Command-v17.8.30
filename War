@@ -1,0 +1,370 @@
+// ==UserScript==
+// @author       Bagobo
+// @name         Spartan War Command v17.8.33
+// @namespace    torn.war.intel
+// @version      17.8.33
+// @description  Fixed Refresh + Members Display
+// @match        https://www.torn.com/factions.php*
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+
+    const API_KEY_STORAGE = "spartan_api_key";
+    const STATE_KEY = "spartan_state_v17";
+    const PRIORITY_KEY = "spartan_priority_targets";
+
+    let API_KEY = localStorage.getItem(API_KEY_STORAGE) || "";
+
+    let state = { 
+        x: 20, y: 80, compact: true, showOwnFaction: false, filter: "all",
+        showWelcome: true 
+    };
+
+    let enemyRoster = {}, ownRoster = {};
+    let statusCache = {}, statsCache = {};
+    let myStats = { total: 0 };
+    let search = "";
+    let priorityTargets = new Set(JSON.parse(localStorage.getItem(PRIORITY_KEY) || "[]"));
+
+    const now = () => Math.floor(Date.now() / 1000);
+
+    function fmt(t) {
+        t = Math.max(0, t);
+        return Math.floor(t/60) + ":" + (t%60).toString().padStart(2, '0');
+    }
+
+    try {
+        const saved = JSON.parse(localStorage.getItem(STATE_KEY));
+        if (saved) state = Object.assign({}, state, saved);
+    } catch(e) {}
+
+    function saveState() { try { localStorage.setItem(STATE_KEY, JSON.stringify(state)); } catch(e) {} }
+    function savePriorities() { try { localStorage.setItem(PRIORITY_KEY, JSON.stringify(Array.from(priorityTargets))); } catch(e) {} }
+
+    const panel = document.createElement("div");
+    Object.assign(panel.style, {
+        position: "fixed", top: state.y+"px", left: state.x+"px", width: "70px",
+        background: "#0f0f0f", color: "#fff", border: "1px solid #333", borderRadius: "8px",
+        padding: "6px", zIndex: 999999, fontSize: "10px", fontFamily: "Arial",
+        maxHeight: "85vh", display: "flex", flexDirection: "column", userSelect: "none", overflow: "hidden"
+    });
+
+    panel.innerHTML = `
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+            <div id="toggle" style="width:46px;height:46px;background:#222;border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer;">▢</div>
+            <div id="settings" style="width:46px;height:46px;background:#222;border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer;">⚙️</div>
+            <div id="infoBtn" style="width:46px;height:46px;background:#222;border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:18px;">ℹ️</div>
+            <div id="refreshPanel" style="width:46px;height:46px;background:#222;border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer;">🔄</div>
+            <div id="factionToggle" style="flex:1;text-align:center;font-weight:bold;background:#111;padding:6px;border-radius:6px;cursor:pointer;display:none;">ENEMY FACTION</div>
+        </div>
+
+        <div id="welcome" style="background:#1a1a1a;padding:10px;border-radius:6px;margin-bottom:8px;font-size:9.5px;line-height:1.4;display:none;">
+            <strong>Spartan War Command v17.8.33</strong><br>
+            by Bagobo<br><br>
+            <strong>What is this script?</strong><br>
+            A war intel tool that shows enemy (or your) faction members with:<br>
+            • Hospital timers<br>
+            • Battle stats (FFScounter)<br>
+            • Priority targets<br>
+            • Auto CALL to faction chat<br><br>
+            <button id="gotIt" style="background:#0066cc;color:white;border:none;padding:6px 12px;border-radius:4px;width:100%;">Got it! Hide this</button>
+        </div>
+
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+            <div id="myStats" style="flex:1;background:#1a1a1a;padding:6px;border-radius:4px;font-size:9px;text-align:center;display:none;">Your FFScounter: 0</div>
+            <button id="filterBtn" style="padding:4px 10px;font-size:9px;background:#555;color:white;border:none;border-radius:4px;white-space:nowrap;display:none;">Filter: All</button>
+        </div>
+
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+            <input id="search" placeholder="Search..." style="flex:1;padding:5px;font-size:9px;border:none;border-radius:4px;display:none;">
+            <span id="onlineCount" style="font-size:9px;color:#66ff99;display:none;white-space:nowrap;"></span>
+        </div>
+
+        <div id="prioritySection" style="display:none;"></div>
+        <div id="list" style="flex:1;overflow-y:auto;display:none;"></div>
+    `;
+
+    document.body.appendChild(panel);
+
+    const listEl = document.getElementById("list");
+    const prioritySection = document.getElementById("prioritySection");
+    const filterBtn = document.getElementById("filterBtn");
+    const myStatsEl = document.getElementById("myStats");
+    const searchEl = document.getElementById("search");
+    const onlineCountEl = document.getElementById("onlineCount");
+    const welcomeEl = document.getElementById("welcome");
+
+    function updateMyStats() {
+        myStatsEl.textContent = "Your FFScounter: " + myStats.total.toLocaleString();
+    }
+
+    function applyUIState() {
+        var c = state.compact;
+        searchEl.style.display = c ? "none" : "block";
+        listEl.style.display = c ? "none" : "block";
+        myStatsEl.style.display = c ? "none" : "block";
+        filterBtn.style.display = c ? "none" : "inline-block";
+        onlineCountEl.style.display = c ? "none" : "inline-block";
+        document.getElementById("factionToggle").style.display = c ? "none" : "block";
+        welcomeEl.style.display = (!c && state.showWelcome) ? "block" : "none";
+        panel.style.width = c ? "70px" : "320px";
+        document.getElementById("toggle").textContent = c ? "▢" : "▣";
+    }
+    applyUIState();
+
+    // Info Button
+    document.getElementById("infoBtn").onclick = function() {
+        state.showWelcome = !state.showWelcome;
+        welcomeEl.style.display = state.showWelcome ? "block" : "none";
+        saveState();
+    };
+
+    document.getElementById("gotIt").onclick = function() {
+        state.showWelcome = false;
+        saveState();
+        welcomeEl.style.display = "none";
+    };
+
+    document.getElementById("toggle").onclick = function() {
+        state.compact = !state.compact;
+        applyUIState();
+        saveState();
+        if (!state.compact) renderList();
+    };
+
+    document.getElementById("refreshPanel").onclick = function() {
+        statusCache = {};
+        statsCache = {};
+        alert("Refreshing all data...");
+        loop();
+    };
+
+    // Faction Toggle
+    document.getElementById("factionToggle").onclick = function() {
+        state.showOwnFaction = !state.showOwnFaction;
+        this.textContent = state.showOwnFaction ? "OWN FACTION" : "ENEMY FACTION";
+        saveState();
+        renderList();
+    };
+
+    const filterOptions = ["all", "hospital", "okay", "travel"];
+    let filterIndex = 0;
+
+    filterBtn.onclick = function() {
+        filterIndex = (filterIndex + 1) % filterOptions.length;
+        state.filter = filterOptions[filterIndex];
+        this.textContent = "Filter: " + state.filter.charAt(0).toUpperCase() + state.filter.slice(1);
+        saveState();
+        renderList();
+    };
+
+    searchEl.oninput = function() {
+        search = this.value.toLowerCase().trim();
+        renderList();
+    };
+
+    function sendToFactionChat(text) {
+        navigator.clipboard.writeText(text);
+        setTimeout(() => {
+            try {
+                const candidates = document.querySelectorAll('input, textarea');
+                for (let input of candidates) {
+                    if (input && input.offsetParent !== null) {
+                        input.focus();
+                        input.value = text;
+                        input.dispatchEvent(new Event('input', {bubbles:true}));
+                        setTimeout(() => {
+                            input.dispatchEvent(new KeyboardEvent('keypress', {key:'Enter', bubbles:true}));
+                        }, 500);
+                        return;
+                    }
+                }
+            } catch(e) {}
+        }, 300);
+    }
+
+    function openProfile(id) {
+        window.open("https://www.torn.com/profiles.php?XID=" + id, "_blank");
+    }
+
+    function togglePriority(id) {
+        if (priorityTargets.has(id)) priorityTargets.delete(id);
+        else priorityTargets.add(id);
+        savePriorities();
+        renderList();
+    }
+
+    function getBSPColor(diff) {
+        if (diff >= 5000) return {t:"#ff4444", b:"#441111"};
+        if (diff >= 2000) return {t:"#ffcc44", b:"#443311"};
+        if (diff >= -2000) return {t:"#44ff88", b:"#113311"};
+        return {t:"#bbbbbb", b:"#222222"};
+    }
+
+    function getStatusHTML(c) {
+        if (!c) return '<span style="color:#888">Unknown</span>';
+        var t = now();
+        if (c.state === "Hospital") return '<span style="color:#ff6666">Hospital ' + fmt(c.until - t) + '</span>';
+        if (c.state === "Jail") return '<span style="color:#ffaa44">Jail</span>';
+        if (c.state === "Traveling" || c.state === "Abroad") return '<span style="color:#44aaff">Traveling</span>';
+        if (c.state === "Okay") return '<span style="color:#66ff99">Okay</span>';
+        return '<span style="color:#888">Offline</span>';
+    }
+
+    function renderList() {
+        var roster = state.showOwnFaction ? ownRoster : enemyRoster;
+        var priorityEntries = [];
+        var normalEntries = [];
+        var matchCount = 0;
+        var totalMembers = Object.keys(roster).length || 0;
+        var onlineCount = 0;
+
+        for (var id in roster) {
+            var m = roster[id];
+            var name = m.name || "Unknown";
+            if (search && name.toLowerCase().indexOf(search) === -1) continue;
+
+            var status = statusCache[id];
+            var stats = statsCache[id] || {total: 0};
+            var diff = stats.total - myStats.total;
+            var col = getBSPColor(diff);
+            var prio = priorityTargets.has(id);
+
+            var st = status ? status.state.toLowerCase() : "";
+
+            if (status && status.state === "Okay") onlineCount++;
+
+            var matchesFilter = true;
+            if (state.filter !== "all") {
+                if (state.filter === "hospital" && st !== "hospital") matchesFilter = false;
+                if (state.filter === "okay" && st !== "okay") matchesFilter = false;
+                if (state.filter === "travel" && !["traveling","abroad"].includes(st)) matchesFilter = false;
+            }
+            if (matchesFilter) matchCount++;
+
+            if (!matchesFilter) continue;
+
+            var timeStr = (status && status.state === "Hospital") ? fmt(status.until - now()) : "";
+            var callText = name + (timeStr ? " | " + timeStr : "");
+
+            var ffText = (stats.total > 100) 
+                ? "FFS " + stats.total.toLocaleString() + " (" + (diff >= 0 ? "+" : "") + diff.toLocaleString() + ")"
+                : "FFS Loading...";
+
+            var entry = '<div data-id="' + id + '" style="margin:4px 0;padding:8px;border-radius:5px;background:' + (prio ? '#442211' : col.b) + ';border-left:4px solid ' + col.t + ';">';
+            entry += '<div style="display:flex;justify-content:space-between;align-items:center;">';
+            entry += '<div class="p-link" style="color:#66ccff;text-decoration:underline;cursor:pointer;flex:1;">' + name + ' <span style="color:#888;font-size:9px;">[' + id + ']</span></div>';
+            entry += '<div>';
+            entry += '<button class="pr-btn" data-id="' + id + '" style="margin-right:4px;padding:2px 8px;font-size:9px;background:' + (prio ? '#cc6600' : '#444') + ';">' + (prio ? '★' : '☆') + '</button>';
+            entry += '<button class="call-btn" data-text="' + callText + '" style="padding:2px 8px;font-size:9px;background:#0066cc;color:white;">CALL</button>';
+            entry += '</div></div>';
+            entry += '<div style="margin-top:4px;font-size:9.5px;display:flex;justify-content:space-between;">';
+            entry += '<span>' + getStatusHTML(status) + '</span>';
+            entry += '<span style="color:' + col.t + ';font-weight:bold;">' + ffText + '</span>';
+            entry += '</div></div>';
+
+            if (prio) priorityEntries.push(entry);
+            else normalEntries.push({name: name.toLowerCase(), html: entry});
+        }
+
+        normalEntries.sort(function(a, b) { return a.name.localeCompare(b.name); });
+
+        prioritySection.innerHTML = priorityEntries.length ? "<div style='color:#ffaa00;font-size:9px;margin:4px 0 2px 0;'>★ PRIORITY TARGETS</div>" + priorityEntries.join("") : "";
+        prioritySection.style.display = priorityEntries.length ? "block" : "none";
+
+        listEl.innerHTML = normalEntries.map(function(item){ return item.html; }).join("") || '<div style="color:#aaa;text-align:center;padding:20px;">No members found</div>';
+
+        if (state.filter === "all") {
+            onlineCountEl.textContent = onlineCount + "/" + totalMembers + " online";
+        } else {
+            onlineCountEl.textContent = matchCount + "/" + totalMembers;
+        }
+
+        // Event handlers
+        [prioritySection, listEl].forEach(function(container) {
+            var plinks = container.getElementsByClassName("p-link");
+            for (var i = 0; i < plinks.length; i++) {
+                plinks[i].onclick = function() { openProfile(this.parentElement.parentElement.dataset.id); };
+            }
+            var callBtns = container.getElementsByClassName("call-btn");
+            for (var i = 0; i < callBtns.length; i++) {
+                callBtns[i].onclick = function() { sendToFactionChat(this.dataset.text); };
+            }
+            var prBtns = container.getElementsByClassName("pr-btn");
+            for (var i = 0; i < prBtns.length; i++) {
+                prBtns[i].onclick = function() { togglePriority(this.dataset.id); };
+            }
+        });
+    }
+
+    async function loadMyStats() {
+        if (!API_KEY) return;
+        try {
+            var d = await (await fetch("https://api.torn.com/user/?selections=battlestats&key=" + API_KEY)).json();
+            if (d?.strength) {
+                myStats.total = d.strength + d.dexterity + d.defense + d.speed;
+                updateMyStats();
+            }
+        } catch(e) {}
+    }
+
+    async function loadRosters() {
+        if (!API_KEY) return;
+        try {
+            if (state.showOwnFaction) {
+                var od = await (await fetch("https://api.torn.com/faction/?selections=basic&key=" + API_KEY)).json();
+                ownRoster = od.members || {};
+            } else {
+                var w = await (await fetch("https://api.torn.com/faction/?selections=rankedwars,basic&key=" + API_KEY)).json();
+                if (w?.rankedwar) {
+                    var f = w.rankedwar.factions;
+                    var myId = w.rankedwar.faction_id || (f.attacking_faction ? f.attacking_faction.id : null);
+                    var eId = f.attacking_faction && f.attacking_faction.id === myId ? f.defending_faction.id : (f.attacking_faction ? f.attacking_faction.id : null);
+                    if (eId) {
+                        var ed = await (await fetch("https://api.torn.com/faction/" + eId + "?selections=basic&key=" + API_KEY)).json();
+                        enemyRoster = ed.members || {};
+                    }
+                }
+            }
+        } catch(e) {}
+    }
+
+    async function updateStatusesAndStats() {
+        var roster = state.showOwnFaction ? ownRoster : enemyRoster;
+        var t = now();
+        for (var id in roster) {
+            try {
+                if (!statusCache[id] || t - (statusCache[id].t||0) > 60) {
+                    var s = await (await fetch("https://api.torn.com/user/" + id + "?selections=profile&key=" + API_KEY)).json();
+                    if (s?.status) statusCache[id] = {state:s.status.state, until:s.status.until||0, t};
+                }
+                if (!statsCache[id] || t - (statsCache[id].t||0) > 300) {
+                    var b = await (await fetch("https://api.torn.com/user/" + id + "?selections=battlestats&key=" + API_KEY)).json();
+                    if (b?.strength) statsCache[id] = {total: b.strength + b.dexterity + b.defense + b.speed, t};
+                }
+            } catch(e) {}
+        }
+    }
+
+    async function loop() {
+        if (!API_KEY) {
+            listEl.innerHTML = '<div style="color:#ff5555;text-align:center;padding:40px;">Set API Key in ⚙️</div>';
+            setTimeout(loop, 5000);
+            return;
+        }
+
+        await loadMyStats();
+        await loadRosters();
+        await updateStatusesAndStats();
+        renderList();
+
+        setTimeout(loop, 30000);
+    }
+
+    setInterval(() => {
+        if (!state.compact) renderList();
+    }, 1000);
+
+    loop();
+})();
